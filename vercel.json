@@ -1,11 +1,5 @@
 {
-  "functions": {
-    "api/index.py": {
-      "runtime": "python3.9",
-      "maxDuration": 10
-    }
-  },
-  "env": {
-    "API_TOKEN": "@api_token"
-  }
+  "version": 2,
+  "builds": [{ "src": "api/index.py", "use": "@vercel/python" }],
+  "routes": [{ "src": "/(.*)", "dest": "api/index.py" }]
 }
