@@ -2,7 +2,7 @@
   "functions": {
     "api/index.py": {
       "runtime": "python3.9",
-      "maxDuration": 10
+      "maxDuration": 30
     }
   },
   "env": {
