@@ -18,12 +18,16 @@ CHANNEL_ID = '@Scammerawarealert'
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# File Path
 USERS_FILE = '/tmp/users.json'
+
+# States (SAME AS ORIGINAL)
 ASK_USERNAME, ASK_DESCRIPTION, ASK_AMOUNT, ASK_PROOF_LINK = range(4)
 
 user_states = {}
 reports = {}
 
+# --- DATABASE ---
 def load_users():
     if os.path.exists(USERS_FILE):
         try:
@@ -38,7 +42,7 @@ def save_users(users):
 
 all_users = load_users()
 
-# --- HANDLERS (EXACT ORIGINAL LOGIC) ---
+# --- HANDLERS (EXACT ORIGINAL LOGIC & TEXT) ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user: return
     user_id = update.effective_user.id
@@ -72,6 +76,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_states[user_id] = ASK_PROOF_LINK
         await update.message.reply_text("Step 4: Send the Proof Link.\n\nCreate a channel, upload proofs, and send the link here:")
     elif state == ASK_PROOF_LINK:
+        # Fixed validation so it doesn't fail on capital letters
         if not (text.lower().startswith("http") or text.lower().startswith("t.me")):
             await update.message.reply_text("❌ Invalid link! Send a valid URL (https://... or t.me/...)")
             return
@@ -104,10 +109,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try: await context.bot.send_message(r_user_id, "✅ Your report has been approved and posted on @Scammerawarealert.")
         except: pass
         await query.edit_message_text(f"{query.message.text}\n\n✅ *Status: Approved*", parse_mode='Markdown')
+        reports.pop(r_user_id, None)
     elif action == "reject":
         try: await context.bot.send_message(r_user_id, "❌ Your report was rejected by the admin.")
         except: pass
         await query.edit_message_text(f"{query.message.text}\n\n❌ *Status: Rejected*", parse_mode='Markdown')
+        reports.pop(r_user_id, None)
     await query.answer()
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -126,26 +133,24 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- VERCEL INTEGRATION ---
 app = Flask(__name__)
-# Global application instance
 bot_app = ApplicationBuilder().token(API_TOKEN).build()
+
+# Build app handlers once
+bot_app.add_handler(CommandHandler("start", start))
+bot_app.add_handler(CommandHandler("stats", stats))
+bot_app.add_handler(CommandHandler("broadcast", broadcast))
+bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+bot_app.add_handler(CallbackQueryHandler(handle_callback))
 
 @app.route('/', methods=['POST', 'GET'])
 async def v_handler():
     if request.method == 'POST':
         try:
-            # Initialize bot if not initialized
-            if not bot_app.handlers:
-                bot_app.add_handler(CommandHandler("start", start))
-                bot_app.add_handler(CommandHandler("stats", stats))
-                bot_app.add_handler(CommandHandler("broadcast", broadcast))
-                bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-                bot_app.add_handler(CallbackQueryHandler(handle_callback))
-            
             update = Update.de_json(request.get_json(force=True), bot_app.bot)
             async with bot_app:
                 await bot_app.process_update(update)
             return 'ok', 200
         except Exception as e:
             logger.error(f"Error: {e}")
-            return str(e), 500 # This will show the error in browser for debugging
-    return 'Bot is active', 200
+            return str(e), 500
+    return 'Bot is Online', 200
