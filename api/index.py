@@ -1,8 +1,6 @@
 import logging
 import json
 import os
-import asyncio
-from flask import Flask, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
@@ -39,11 +37,8 @@ def load_users():
     return set()
 
 def save_users(users):
-    try:
-        with open(USERS_FILE, 'w') as f:
-            json.dump(list(users), f)
-    except:
-        pass
+    with open(USERS_FILE, 'w') as f:
+        json.dump(list(users), f)
 
 all_users = load_users()
 
@@ -211,24 +206,73 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"📢 Broadcast sent to {count} users.")
 
 # --- VERCEL SERVERLESS WRAPPER ---
-app = Flask(__name__)
-application = ApplicationBuilder().token(API_TOKEN).build()
+from telegram.ext import Application
+from telegram import Bot
+import asyncio
 
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("stats", stats))
-application.add_handler(CommandHandler("broadcast", broadcast))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-application.add_handler(CallbackQueryHandler(handle_callback))
+application = None
 
-@app.route('/', methods=['POST', 'GET'])
-async def webhook():
-    if request.method == 'POST':
+async def setup_webhook():
+    global application
+    if application is None:
+        application = ApplicationBuilder().token(API_TOKEN).build()
+        
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("stats", stats))
+        application.add_handler(CommandHandler("broadcast", broadcast))
+        
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+        application.add_handler(CallbackQueryHandler(handle_callback))
+        
+        await application.initialize()
+        await application.start()
+    return application
+
+async def shutdown_webhook():
+    global application
+    if application:
+        await application.stop()
+        await application.shutdown()
+        application = None
+
+from http.server import BaseHTTPRequestHandler
+import json as json_lib
+
+class handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        content_length = int(self.headers['Content-Length'])
+        post_data = self.rfile.read(content_length)
+        update_json = json_lib.loads(post_data.decode('utf-8'))
+        
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
         try:
-            update = Update.de_json(request.get_json(force=True), application.bot)
-            async with application:
-                await application.process_update(update)
-            return 'ok', 200
+            app = loop.run_until_complete(setup_webhook())
+            update = Update.de_json(update_json, app.bot)
+            loop.run_until_complete(app.process_update(update))
+            
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json_lib.dumps({"status": "ok"}).encode())
         except Exception as e:
-            logger.error(f"Error: {e}")
-            return str(e), 500
-    return 'Bot is Online', 200
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(json_lib.dumps({"error": str(e)}).encode())
+        finally:
+            loop.run_until_complete(shutdown_webhook())
+            loop.close()
+    
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"Bot is running on Vercel. Set webhook to this URL.")
+
+# For local testing only
+if __name__ == '__main__':
+    from http.server import HTTPServer
+    server = HTTPServer(('localhost', 8000), handler)
+    print("Local server running on port 8000")
+    server.serve_forever()
