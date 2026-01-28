@@ -1,6 +1,8 @@
 import logging
 import json
 import os
+import asyncio
+from flask import Flask, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
@@ -37,8 +39,11 @@ def load_users():
     return set()
 
 def save_users(users):
-    with open(USERS_FILE, 'w') as f:
-        json.dump(list(users), f)
+    try:
+        with open(USERS_FILE, 'w') as f:
+            json.dump(list(users), f)
+    except:
+        pass
 
 all_users = load_users()
 
@@ -61,19 +66,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Error Fix: Check if message exists (Avoid crash on edits)
     if not update.message or not update.message.text:
         return
 
     user_id = update.effective_user.id
-    text = update.message.text
+    text = update.message.text.strip() # Sirf extra space hatane ke liye
     state = user_states.get(user_id)
 
-    # Agar user process mein nahi hai, toh ignore karein
     if state is None:
         return
 
-    # State Machine Logic
     if state == ASK_USERNAME:
         reports[user_id]['scammer'] = text
         user_states[user_id] = ASK_DESCRIPTION
@@ -93,7 +95,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif state == ASK_PROOF_LINK:
-        if not (text.startswith("http") or text.startswith("t.me")):
+        # FIX: Added .lower() so it accepts T.me, https:// etc.
+        if not (text.lower().startswith("http") or text.lower().startswith("t.me")):
             await update.message.reply_text("❌ Invalid link! Send a valid URL (https://... or t.me/...)")
             return
             
@@ -115,7 +118,6 @@ async def submit_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📝 *Description:* {report['description']}"
     )
 
-    # Keyboard layout requested: Row 1 (View Proof), Row 2 (Accept, Reject)
     keyboard = [
         [InlineKeyboardButton("🔍 View Proofs", url=report['proof_link'])],
         [InlineKeyboardButton("✅ Accept", callback_data=f"approve_{user_id}"),
@@ -141,7 +143,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     report = reports.get(r_user_id)
     
-    # Callback handling
     if action == "approve":
         if not report:
             await query.answer("Report data lost! Admin cannot approve.", show_alert=True)
@@ -170,6 +171,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         try:
+            # USER KO MESSAGE YAHAN JATA HAI (SAME TEXT)
             await context.bot.send_message(r_user_id, "✅ Your report has been approved and posted on @Scammerawarealert.")
         except: pass
         
@@ -185,7 +187,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.answer()
 
-# --- ADMIN COMMANDS ---
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_USER_ID: return
     await update.message.reply_text(f"📊 *Total Users:* {len(all_users)}")
@@ -205,74 +206,21 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except: pass
     await update.message.reply_text(f"📢 Broadcast sent to {count} users.")
 
-# --- VERCEL SERVERLESS WRAPPER ---
-from telegram.ext import Application
-from telegram import Bot
-import asyncio
+# --- VERCEL WRAPPER ---
+app = Flask(__name__)
+bot_application = ApplicationBuilder().token(API_TOKEN).build()
 
-application = None
+bot_application.add_handler(CommandHandler("start", start))
+bot_application.add_handler(CommandHandler("stats", stats))
+bot_application.add_handler(CommandHandler("broadcast", broadcast))
+bot_application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+bot_application.add_handler(CallbackQueryHandler(handle_callback))
 
-async def setup_webhook():
-    global application
-    if application is None:
-        application = ApplicationBuilder().token(API_TOKEN).build()
-        
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CommandHandler("stats", stats))
-        application.add_handler(CommandHandler("broadcast", broadcast))
-        
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-        application.add_handler(CallbackQueryHandler(handle_callback))
-        
-        await application.initialize()
-        await application.start()
-    return application
-
-async def shutdown_webhook():
-    global application
-    if application:
-        await application.stop()
-        await application.shutdown()
-        application = None
-
-from http.server import BaseHTTPRequestHandler
-import json as json_lib
-
-class handler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        content_length = int(self.headers['Content-Length'])
-        post_data = self.rfile.read(content_length)
-        update_json = json_lib.loads(post_data.decode('utf-8'))
-        
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        try:
-            app = loop.run_until_complete(setup_webhook())
-            update = Update.de_json(update_json, app.bot)
-            loop.run_until_complete(app.process_update(update))
-            
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json_lib.dumps({"status": "ok"}).encode())
-        except Exception as e:
-            self.send_response(500)
-            self.end_headers()
-            self.wfile.write(json_lib.dumps({"error": str(e)}).encode())
-        finally:
-            loop.run_until_complete(shutdown_webhook())
-            loop.close()
-    
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/plain')
-        self.end_headers()
-        self.wfile.write(b"Bot is running on Vercel. Set webhook to this URL.")
-
-# For local testing only
-if __name__ == '__main__':
-    from http.server import HTTPServer
-    server = HTTPServer(('localhost', 8000), handler)
-    print("Local server running on port 8000")
-    server.serve_forever()
+@app.route('/', methods=['POST', 'GET'])
+async def v_handler():
+    if request.method == 'POST':
+        update = Update.de_json(request.get_json(force=True), bot_application.bot)
+        async with bot_application:
+            await bot_application.process_update(update)
+        return 'ok', 200
+    return 'Bot is active', 200
