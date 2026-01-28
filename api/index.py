@@ -23,9 +23,9 @@ USERS_FILE = '/tmp/users.json'
 # States for conversation
 ASK_USERNAME, ASK_DESCRIPTION, ASK_AMOUNT, ASK_PROOF_LINK = range(4)
 
-# Temporary memory storage
-user_states = {}
-reports = {}
+# --- PERSISTENT STORAGE FILES ---
+STATES_FILE = '/tmp/user_states.json'
+REPORTS_FILE = '/tmp/reports.json'
 
 # --- DATABASE FUNCTIONS ---
 def load_users():
@@ -41,11 +41,43 @@ def save_users(users):
     with open(USERS_FILE, 'w') as f:
         json.dump(list(users), f)
 
+def load_states():
+    if os.path.exists(STATES_FILE):
+        try:
+            with open(STATES_FILE, 'r') as f:
+                data = json.load(f)
+                return {int(k): v for k, v in data.items()}
+        except:
+            return {}
+    return {}
+
+def save_states(states):
+    with open(STATES_FILE, 'w') as f:
+        json.dump(states, f)
+
+def load_reports():
+    if os.path.exists(REPORTS_FILE):
+        try:
+            with open(REPORTS_FILE, 'r') as f:
+                data = json.load(f)
+                return {int(k): v for k, v in data.items()}
+        except:
+            return {}
+    return {}
+
+def save_reports(reports):
+    with open(REPORTS_FILE, 'w') as f:
+        json.dump(reports, f)
+
+# Load persistent data
 all_users = load_users()
+user_states = load_states()
+reports = load_reports()
 
 # --- COMMAND HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user: return
+    if not update.effective_user: 
+        return
     user_id = update.effective_user.id
     
     # Save user for broadcast
@@ -54,7 +86,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_users(all_users)
 
     user_states[user_id] = ASK_USERNAME
-    reports[user_id] = {} 
+    reports[user_id] = {}
+    
+    # Save to files
+    save_states(user_states)
+    save_reports(reports)
     
     await update.effective_message.reply_text(
         "Welcome to Scammer Report Bot! 👮\n\n"
@@ -62,16 +98,30 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Error Fix: Check if message exists (Avoid crash on edits)
     if not update.message or not update.message.text:
         return
 
     user_id = update.effective_user.id
     text = update.message.text.strip()
+    
+    # Reload from files (in case another instance updated)
+    global user_states, reports
+    user_states = load_states()
+    reports = load_reports()
+    
     state = user_states.get(user_id)
 
-    # Agar user process mein nahi hai, toh ignore karein
     if state is None:
+        # If user was in middle of process but state lost, restart
+        user_states[user_id] = ASK_USERNAME
+        reports[user_id] = {}
+        save_states(user_states)
+        save_reports(reports)
+        
+        await update.message.reply_text(
+            "Welcome to Scammer Report Bot! 👮\n\n"
+            "Step 1: Send the Scammer's @Username (or name if username is not available):"
+        )
         return
 
     # State Machine Logic
@@ -130,14 +180,30 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
             
         reports[user_id]['proof_link'] = text
+        
+        # Save before submitting
+        save_states(user_states)
+        save_reports(reports)
+        
         await submit_to_admin(update, context)
+
+    # Save state after each step
+    save_states(user_states)
+    save_reports(reports)
 
 # --- SUBMISSION TO ADMIN ---
 async def submit_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    
+    # Reload reports to ensure we have latest
+    global reports
+    reports = load_reports()
+    
     report = reports.get(user_id)
 
-    if not report: return
+    if not report: 
+        await update.message.reply_text("❌ Error: Report data not found. Please start again with /start")
+        return
 
     admin_caption = (
         f"📩 *New Scam Report Submitted*\n\n"
@@ -162,18 +228,31 @@ async def submit_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     await update.message.reply_text("✅ Your report has been sent to Admin for review.")
+    
+    # Clear user state but keep report for admin action
+    global user_states
+    user_states = load_states()
     user_states.pop(user_id, None)
+    save_states(user_states)
 
 # --- CALLBACK HANDLER (ADMIN ACTIONS) ---
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
-    action, r_user_id = data.split('_')
-    r_user_id = int(r_user_id)
+    
+    try:
+        action, r_user_id_str = data.split('_')
+        r_user_id = int(r_user_id_str)
+    except:
+        await query.answer("Invalid callback data", show_alert=True)
+        return
+    
+    # Reload reports to ensure we have latest data
+    global reports
+    reports = load_reports()
     
     report = reports.get(r_user_id)
     
-    # Callback handling
     if action == "approve":
         if not report:
             await query.answer("Report data lost! Admin cannot approve.", show_alert=True)
@@ -203,43 +282,65 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             await context.bot.send_message(r_user_id, "✅ Your report has been approved and posted on @Scammerawarealert.")
-        except: pass
+        except: 
+            pass
         
         await query.edit_message_text(f"{query.message.text}\n\n✅ *Status: Approved*", parse_mode='Markdown')
+        
+        # Remove report after approval
         reports.pop(r_user_id, None)
+        save_reports(reports)
         
     elif action == "reject":
         try:
             await context.bot.send_message(r_user_id, "❌ Your report was rejected by the admin.")
-        except: pass
+        except: 
+            pass
         await query.edit_message_text(f"{query.message.text}\n\n❌ *Status: Rejected*", parse_mode='Markdown')
+        
+        # Remove report after rejection
         reports.pop(r_user_id, None)
+        save_reports(reports)
 
     await query.answer()
 
 # --- ADMIN COMMANDS ---
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_USER_ID: return
+    if update.effective_user.id != ADMIN_USER_ID: 
+        return
+    
+    # Reload data
+    global all_users
+    all_users = load_users()
+    
     await update.message.reply_text(f"📊 *Total Users:* {len(all_users)}")
 
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_USER_ID: return
+    if update.effective_user.id != ADMIN_USER_ID: 
+        return
+    
     if not context.args:
         await update.message.reply_text("Usage: /broadcast message")
         return
 
     msg = " ".join(context.args)
     count = 0
+    
+    # Reload users
+    global all_users
+    all_users = load_users()
+    
     for u_id in list(all_users):
         try:
             await context.bot.send_message(u_id, msg)
             count += 1
-        except: pass
+        except: 
+            pass
+    
     await update.message.reply_text(f"📢 Broadcast sent to {count} users.")
 
 # --- VERCEL SERVERLESS WRAPPER ---
 from telegram.ext import Application
-from telegram import Bot
 import asyncio
 
 application = None
