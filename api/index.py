@@ -14,125 +14,221 @@ API_TOKEN = os.environ.get('API_TOKEN')
 ADMIN_USER_ID = 6899720377
 CHANNEL_ID = '@Scammerawarealert'
 
-# Logging
+# Logging setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# File Path
+# File to store user IDs for broadcast
 USERS_FILE = '/tmp/users.json'
 
-# States
+# States for conversation
 ASK_USERNAME, ASK_DESCRIPTION, ASK_AMOUNT, ASK_PROOF_LINK = range(4)
 
+# Temporary memory storage
 user_states = {}
 reports = {}
 
-# --- DATABASE ---
+# --- DATABASE FUNCTIONS ---
 def load_users():
     if os.path.exists(USERS_FILE):
         try:
             with open(USERS_FILE, 'r') as f:
                 return set(json.load(f))
-        except: return set()
+        except:
+            return set()
     return set()
 
 def save_users(users):
     try:
         with open(USERS_FILE, 'w') as f:
             json.dump(list(users), f)
-    except: pass
+    except:
+        pass
 
 all_users = load_users()
 
-# --- HANDLERS (Unmodified Logic) ---
+# --- COMMAND HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user: return
     user_id = update.effective_user.id
+    
+    # Save user for broadcast
     if user_id not in all_users:
         all_users.add(user_id)
         save_users(all_users)
+
     user_states[user_id] = ASK_USERNAME
     reports[user_id] = {} 
-    await update.effective_message.reply_text("Welcome! Step 1: Send Scammer's @Username:")
+    
+    await update.effective_message.reply_text(
+        "Welcome to Scammer Report Bot! 👮\n\n"
+        "Step 1: Send the Scammer's @Username (or name if username is not available):"
+    )
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text: return
+    # Error Fix: Check if message exists (Avoid crash on edits)
+    if not update.message or not update.message.text:
+        return
+
     user_id = update.effective_user.id
     text = update.message.text
     state = user_states.get(user_id)
-    if state is None: return
 
+    # Agar user process mein nahi hai, toh ignore karein
+    if state is None:
+        return
+
+    # State Machine Logic
     if state == ASK_USERNAME:
         reports[user_id]['scammer'] = text
         user_states[user_id] = ASK_DESCRIPTION
-        await update.message.reply_text("Step 2: Describe incident:")
+        await update.message.reply_text("Step 2: Describe the scam incident in detail:")
+
     elif state == ASK_DESCRIPTION:
         reports[user_id]['description'] = text
         user_states[user_id] = ASK_AMOUNT
-        await update.message.reply_text("Step 3: Enter Amount:")
+        await update.message.reply_text("Step 3: Enter the Scammed Amount (e.g. $100 or ₹5000):")
+
     elif state == ASK_AMOUNT:
         reports[user_id]['amount'] = text
         user_states[user_id] = ASK_PROOF_LINK
-        await update.message.reply_text("Step 4: Send Proof Link:")
+        await update.message.reply_text(
+            "Step 4: Send the Proof Link.\n\n"
+            "Create a channel, upload proofs, and send the link here:"
+        )
+
     elif state == ASK_PROOF_LINK:
         if not (text.startswith("http") or text.startswith("t.me")):
-            await update.message.reply_text("❌ Invalid link!")
+            await update.message.reply_text("❌ Invalid link! Send a valid URL (https://... or t.me/...)")
             return
+            
         reports[user_id]['proof_link'] = text
         await submit_to_admin(update, context)
 
+# --- SUBMISSION TO ADMIN ---
 async def submit_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     report = reports.get(user_id)
+
     if not report: return
-    caption = f"🕵️ Scammer: {report['scammer']}\n💰 Amount: {report['amount']}\n📝 Info: {report['description']}"
-    kb = [[InlineKeyboardButton("🔍 Proof", url=report['proof_link'])],
-          [InlineKeyboardButton("✅ Accept", callback_data=f"approve_{user_id}"),
-           InlineKeyboardButton("❌ Reject", callback_data=f"reject_{user_id}")]]
-    await context.bot.send_message(ADMIN_USER_ID, caption, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
-    await update.message.reply_text("✅ Sent to admin.")
+
+    admin_caption = (
+        f"📩 *New Scam Report Submitted*\n\n"
+        f"👤 *Reporter:* [Click here](tg://user?id={user_id})\n"
+        f"🕵️ *Scammer:* {report['scammer']}\n"
+        f"💰 *Amount:* {report['amount']}\n"
+        f"📝 *Description:* {report['description']}"
+    )
+
+    # Keyboard layout requested: Row 1 (View Proof), Row 2 (Accept, Reject)
+    keyboard = [
+        [InlineKeyboardButton("🔍 View Proofs", url=report['proof_link'])],
+        [InlineKeyboardButton("✅ Accept", callback_data=f"approve_{user_id}"),
+         InlineKeyboardButton("❌ Reject", callback_data=f"reject_{user_id}")]
+    ]
+    
+    await context.bot.send_message(
+        ADMIN_USER_ID, 
+        admin_caption, 
+        parse_mode='Markdown', 
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+    await update.message.reply_text("✅ Your report has been sent to Admin for review.")
     user_states.pop(user_id, None)
 
+# --- CALLBACK HANDLER (ADMIN ACTIONS) ---
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    action, r_user_id = query.data.split('_')
+    data = query.data
+    action, r_user_id = data.split('_')
     r_user_id = int(r_user_id)
+    
     report = reports.get(r_user_id)
-    if action == "approve" and report:
-        post = f"🚨 *SCAMMER ALERT*\n\n🕵️ Scammer: {report['scammer']}\n💰 Amount: {report['amount']}"
-        btns = [[InlineKeyboardButton("🖼️ Proof", url=report['proof_link'])]]
-        await context.bot.send_message(CHANNEL_ID, post, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(btns))
-        await query.edit_message_text(f"{query.message.text}\n\n✅ Approved")
+    
+    # Callback handling
+    if action == "approve":
+        if not report:
+            await query.answer("Report data lost! Admin cannot approve.", show_alert=True)
+            return
+
+        channel_post = (
+            f"➖➖➖➖➖➖➖➖➖➖➖➖➖➖\n"
+            f"🚨 *SCAMMER ALERT*\n"
+            f"➖➖➖➖➖➖➖➖➖➖➖➖➖➖\n\n"
+            f"🕵️ *Scammer:* {report['scammer']}\n"
+            f"💰 *Scammed Amount:* {report['amount']}\n"
+            f"📝 *Details:* {report['description']}\n\n"
+            f"⚠️ *Stay alert and don't deal with them!*"
+        )
+
+        channel_buttons = [
+            [InlineKeyboardButton("🖼️ View Proofs", url=report['proof_link'])],
+            [InlineKeyboardButton("👤 Reported By", url=f"tg://user?id={r_user_id}")]
+        ]
+
+        await context.bot.send_message(
+            CHANNEL_ID, 
+            channel_post, 
+            parse_mode='Markdown', 
+            reply_markup=InlineKeyboardMarkup(channel_buttons)
+        )
+
+        try:
+            await context.bot.send_message(r_user_id, "✅ Your report has been approved and posted on @Scammerawarealert.")
+        except: pass
+        
+        await query.edit_message_text(f"{query.message.text}\n\n✅ *Status: Approved*", parse_mode='Markdown')
+        reports.pop(r_user_id, None)
+        
     elif action == "reject":
-        await query.edit_message_text(f"{query.message.text}\n\n❌ Rejected")
+        try:
+            await context.bot.send_message(r_user_id, "❌ Your report was rejected by the admin.")
+        except: pass
+        await query.edit_message_text(f"{query.message.text}\n\n❌ *Status: Rejected*", parse_mode='Markdown')
+        reports.pop(r_user_id, None)
+
     await query.answer()
 
-# --- VERCEL INTEGRATION ---
+# --- ADMIN COMMANDS ---
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_USER_ID: return
+    await update.message.reply_text(f"📊 *Total Users:* {len(all_users)}")
+
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_USER_ID: return
+    if not context.args:
+        await update.message.reply_text("Usage: /broadcast message")
+        return
+
+    msg = " ".join(context.args)
+    count = 0
+    for u_id in list(all_users):
+        try:
+            await context.bot.send_message(u_id, msg)
+            count += 1
+        except: pass
+    await update.message.reply_text(f"📢 Broadcast sent to {count} users.")
+
+# --- VERCEL SERVERLESS WRAPPER ---
 app = Flask(__name__)
-# Initialize ptb_app globally
-ptb_app = ApplicationBuilder().token(API_TOKEN).build()
+application = ApplicationBuilder().token(API_TOKEN).build()
 
-async def setup_ptb():
-    # Registration of handlers
-    ptb_app.add_handler(CommandHandler("start", start))
-    ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    ptb_app.add_handler(CallbackQueryHandler(handle_callback))
-    await ptb_app.initialize()
+application.add_handler(CommandHandler("start", start))
+application.add_handler(CommandHandler("stats", stats))
+application.add_handler(CommandHandler("broadcast", broadcast))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+application.add_handler(CallbackQueryHandler(handle_callback))
 
-# This is the trick to run async inside sync Flask on Vercel
 @app.route('/', methods=['POST', 'GET'])
-def webhook():
+async def webhook():
     if request.method == 'POST':
         try:
-            # Create a new event loop for each request
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-            # Setup and Process
-            loop.run_until_complete(setup_ptb())
-            update = Update.de_json(request.get_json(force=True), ptb_app.bot)
-            loop.run_until_complete(ptb_app.process_update(update))
+            update = Update.de_json(request.get_json(force=True), application.bot)
+            async with application:
+                await application.process_update(update)
             return 'ok', 200
         except Exception as e:
             logger.error(f"Error: {e}")
             return str(e), 500
-    return 'Bot is Running', 200
+    return 'Bot is Online', 200
